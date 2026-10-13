@@ -1,0 +1,5 @@
+# Python packages for ghostd.py, login.py and verify_login.py (everything else they use is in the
+# Python standard library). setup.sh installs this into ./venv and then runs
+# "venv/bin/playwright install chromium" to download the Chromium build that Playwright drives.
+# Tested with Playwright 1.63.
+playwright

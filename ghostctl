@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# ghostctl - manage the Gmail ghost mark-as-read daemon and accounts.
+#
+#   ghostctl status                 - is the daemon running?
+#   ghostctl list                   - Google accounts on the device + which are set up here
+#   ghostctl enable <account>       - sign in to an account (one-time window), enable instant mark-read
+#   ghostctl disable <account>      - sign out + set aside that account's login (kept, not deleted)
+#   ghostctl test <acct> <addr> <subject>   - fire a harmless mark-read command (for checking)
+#   ghostctl doctor                 - check every link and fix what can be fixed
+#   ghostctl logs                   - tail the daemon log
+#
+# The Googlebook's adb address (Wireless debugging IP:PORT) comes from $ANDROID_SERIAL or, if that
+# is not set, from the line ANDROID_SERIAL=IP:PORT in ghost.env next to this script.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PY="$ROOT/venv/bin/python"
+if [ -z "${ANDROID_SERIAL:-}" ] && [ -f "$ROOT/ghost.env" ]; then
+  ANDROID_SERIAL="$(sed -n 's/^ANDROID_SERIAL=//p' "$ROOT/ghost.env" | tail -n 1 | tr -d "\"' ")"
+fi
+if [ -n "${ANDROID_SERIAL:-}" ]; then export ANDROID_SERIAL; else unset ANDROID_SERIAL; fi
+NOTIF_RESTORE="$(command -v notif-restore || true)"
+[ -n "$NOTIF_RESTORE" ] || { [ -x "$ROOT/bin/notif-restore" ] && NOTIF_RESTORE="$ROOT/bin/notif-restore"; } || true
+cmd="${1:-status}"
+
+case "$cmd" in
+  status)
+    echo "daemon: $(systemctl --user is-active ghostd.service 2>/dev/null || echo unknown)"
+    pgrep -f "ghostd.py --adb" >/dev/null && echo "listening on logcat tag GmailGhostCmd" || echo "not listening"
+    ;;
+  list)
+    echo "== Google accounts on the device =="
+    adb shell dumpsys account 2>/dev/null | grep -oE "name=[^,]*@[^,]*" | sed 's/name=//' | sort -u | while read -r a; do
+      case "$a" in
+        *@gmail.com|*@googlemail.com) kind="gmail (ghost mark-read supported)";;
+        *) kind="non-Gmail (not supported by the ghost browser)";;
+      esac
+      if [ -d "$ROOT/profiles/$a" ]; then setup="SET UP"; else setup="not set up"; fi
+      printf "  %-32s %-12s %s\n" "$a" "[$setup]" "$kind"
+    done
+    ;;
+  enable)
+    acct="${2:?account required}"
+    echo "Opening a sign-in window for $acct (finish it on screen)..."
+    DISPLAY="${DISPLAY:-:0}" "$PY" "$ROOT/login.py" "$acct"
+    ;;
+  disable)
+    acct="${2:?account required}"
+    prof="$ROOT/profiles/$acct"
+    if [ -e "$prof" ]; then
+      # sign out + set the profile aside (renamed, NOT deleted - data is preserved)
+      mv "$prof" "$ROOT/profiles/.$acct.disabled.$(date +%s)"
+      echo "Disabled $acct: its login was set aside (kept, not deleted)."
+    else
+      echo "$acct was not set up."
+    fi
+    ;;
+  test)
+    acct="${2:?account}"; addr="${3:?address}"; subj="${4:?subject}"
+    ts=$(( $(date +%s) * 1000 ))
+    adb shell "log -p i -t GmailGhostCmd '{\"id\":\"ctl$ts\",\"ts\":$ts,\"op\":\"markread\",\"account\":\"$acct\",\"address\":\"$addr\",\"subject\":\"$subj\",\"when\":0}'"
+    echo "sent mark-read command; watch: ghostctl logs"
+    ;;
+  doctor)
+    # Check every link and self-heal what's fixable. Safe to run any time (e.g. after an OS update).
+    echo "== Gmail Ghost doctor =="
+    # 1. adb link
+    if adb devices | awk 'NR>1 && $2=="device"{f=1} END{exit !f}'; then
+      echo "[ok]  adb connected (${ANDROID_SERIAL:-default device})"
+    elif [ -n "${ANDROID_SERIAL:-}" ]; then
+      echo "[fix] adb not connected, so reconnecting"; adb connect "$ANDROID_SERIAL" 2>&1 | tail -1
+    else
+      echo "[!!]  adb not connected and no ANDROID_SERIAL set. Put ANDROID_SERIAL=IP:PORT in $ROOT/ghost.env"
+    fi
+    # 2. ghost daemon
+    if [ "$(systemctl --user is-active ghostd.service 2>/dev/null)" = active ]; then
+      echo "[ok]  ghost daemon running"
+    else
+      echo "[fix] daemon down, so restarting it"; systemctl --user restart ghostd.service; sleep 2
+      echo "      now: $(systemctl --user is-active ghostd.service)"
+    fi
+    # 3. Chromium + venv present
+    [ -x "$ROOT/venv/bin/python" ] && [ -d "$HOME/.cache/ms-playwright" ] && echo "[ok]  Playwright + Chromium present" || echo "[!!]  Playwright/Chromium missing. Run ./setup.sh"
+    # 4. account logins still valid
+    for a in "$ROOT"/profiles/*@*; do
+      [ -e "$a" ] || continue; acct="$(basename "$a")"
+      if DISPLAY="${DISPLAY:-:0}" "$PY" "$ROOT/verify_login.py" "$acct" 2>/dev/null | grep -q "SIGNED_IN: True"; then
+        echo "[ok]  $acct signed in"
+      else
+        echo "[!!]  $acct signed out. Run: ./ghostctl enable $acct"
+      fi
+    done
+    # 5. Android side (Keeper access + companion link, Gmail permissions, battery) via notif-restore.
+    #    notif-restore does not check Gmail Go or the accessibility helper.
+    if [ -n "$NOTIF_RESTORE" ]; then
+      echo "[..]  checking Android side (notif-restore status)"; "$NOTIF_RESTORE" status ${ANDROID_SERIAL:+"$ANDROID_SERIAL"} 2>&1 | sed 's/^/      /' | head -20
+    else
+      echo "[!!]  notif-restore not found, so the Android side can't be checked automatically"
+    fi
+    echo "== done =="
+    ;;
+  logs)
+    tail -n 30 -f "$ROOT/logs/ghostd.log"
+    ;;
+  *)
+    grep '^#' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+esac

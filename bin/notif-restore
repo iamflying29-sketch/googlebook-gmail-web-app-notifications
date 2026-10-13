@@ -1,0 +1,201 @@
+#!/bin/bash
+# notif-restore puts back the Googlebook's notification setup (first written 2026-10-11):
+#   * the FULL Gmail app, but only if you supply its APK (GMAIL_APK below; optional, and not
+#     needed when Gmail Go provides the notifications),
+#   * notification permission for Gmail, Chrome, Notification Keeper and any EXTRA_PACKAGES,
+#   * battery "Unrestricted" for Gmail, Chrome and any EXTRA_PACKAGES,
+#   * Notification Keeper: installs it if missing, and sets up notification access and the
+#     companion link. The Keeper then restores every Gmail notification category, including
+#     "Pop on screen", by itself.
+#   It does NOT install or set up Gmail Go, and it does NOT turn on the accessibility helper.
+#
+#   notif-restore            apply everything (safe to run any time, changes only what's off)
+#   notif-restore status     just show the current state (changes nothing)
+#   notif-restore gmail-reset
+#       ONLY if Gmail opens and closes immediately after a reinstall: clears Gmail's app data on
+#       this Googlebook once (emails stay on Google's servers; Notification Keeper puts all Gmail
+#       notification settings back). You'll be asked to type YES first.
+#   notif-restore ... IP:PORT   use this Wireless debugging address instead of the published one
+#
+# Settings (environment variables, all optional):
+#   ANDROID_USER   your Android user ID (default 10; check yours with: adb shell am get-current-user)
+#   KEEPER_APK     the Notification Keeper APK to install if it is missing
+#                  (default ~/googlebook-notification-keeper/NotificationKeeper.apk)
+#   NOTIF_KIT      a folder with spare APKs (default ~/notification-keeper-kit); used when KEEPER_APK
+#                  is missing
+#   GMAIL_APK      a full Gmail APK to install when Gmail is the web-only version (default: none)
+#   EXTRA_PACKAGES more app package names, separated by spaces, that should also get notification
+#                  permission and battery "Unrestricted" (default: none)
+#   ADB_PORT_FILE  a file whose first word is the current Wireless debugging IP:PORT (default: the
+#                  one Shadow Trackpad Fix publishes in the shared Documents folder)
+#
+# Every command has a time limit, and command output is read through a pipe as it arrives
+# ("status" reads the notification service's report this way, with a 30 s limit).
+set -uo pipefail
+
+KIT="${NOTIF_KIT:-$HOME/notification-keeper-kit}"
+GMAIL_APK="${GMAIL_APK:-}"
+EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
+KEEPER_APK_SRC="${KEEPER_APK:-$HOME/googlebook-notification-keeper/NotificationKeeper.apk}"
+ADB_PORT_FILE="${ADB_PORT_FILE:-/mnt/shared/Documents/Shadow Trackpad Fix/adb-port.txt}"
+# Google's public signing certificate for current Gmail builds (Android 13 and later). Older builds
+# also carry Google's legacy certificate f0fd6c5b410f25cb25c3b53346c8972fae30f8ee7411df910480ad6b2d60db83.
+GOOGLE_CERT=7ce83c1b71f3d572fed04c8d40c5cb10ff75e6d87d9df6fbd53f0468c2905053
+U="${ANDROID_USER:-10}"
+KEEPER=local.notifkeeper
+LISTENER=local.notifkeeper/local.notifkeeper.KeeperListener
+# Companion link: Android wants a device address here. This is a made-up, locally administered
+# address (02:..., "NK" for Notification Keeper); it does not belong to any real device.
+KEEPER_MAC=02:4E:4B:00:00:01
+
+MODE=apply
+ADDR=""
+for a in "$@"; do
+    case "$a" in
+        status|apply|gmail-reset) MODE=$a ;;
+        *:*) ADDR=$a ;;
+        *) echo "usage: notif-restore [status|apply|gmail-reset] [IP:PORT]"; exit 2 ;;
+    esac
+done
+
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
+info() { printf '  • %s\n' "$*"; }
+
+# ---- connect -------------------------------------------------------------------------------------
+pick_device() {
+    local d
+    d=$(timeout 10 adb devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}')
+    if [ -z "$d" ]; then
+        if [ -z "$ADDR" ]; then
+            # Shadow Trackpad Fix / Sleep Guard publish the current Wireless debugging address.
+            ADDR=$(cat "$ADB_PORT_FILE" 2>/dev/null | awk '{print $1; exit}')
+        fi
+        [ -n "$ADDR" ] && timeout 15 adb connect "$ADDR" >/dev/null 2>&1
+        d=$(timeout 10 adb devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}')
+    fi
+    if [ -z "$d" ]; then
+        echo "Can't reach the Googlebook. Turn on Wireless debugging (Settings > System > Developer options)"
+        echo "and run: notif-restore IP:PORT   (the address shown on the Wireless debugging screen)"
+        exit 1
+    fi
+    export ANDROID_SERIAL=$d
+}
+sh() { timeout 30 adb shell "$@" 2>&1; }
+
+gmail_version() { sh "dumpsys package com.google.android.gm" | awk -F= '/versionName=/{print $2; exit}'; }
+installed() { sh "pm list packages --user $U $1" | grep -qx "package:$1"; }
+granted() { sh "dumpsys package $1" | grep -q "android.permission.POST_NOTIFICATIONS: granted=true"; }
+unrestricted() {
+    sh "dumpsys deviceidle whitelist" | grep -q ",$1," && \
+    sh "cmd appops get --user $U $1 RUN_ANY_IN_BACKGROUND" | grep -q -E "allow|No operations"
+}
+listener_on() { sh "settings get --user $U secure enabled_notification_listeners" | tr ':' '\n' | grep -qx "$LISTENER"; }
+companion_on() { sh "cmd companiondevice list $U" | grep -q "mPackageName='$KEEPER'"; }
+
+cert_ok() { # $1 = local apk
+    apksigner verify --print-certs "$1" 2>/dev/null | grep -q "certificate SHA-256 digest: $GOOGLE_CERT"
+}
+
+# ---- status --------------------------------------------------------------------------------------
+status() {
+    echo "Gmail:"
+    local v; v=$(gmail_version)
+    if [ -z "$v" ]; then bad "Gmail isn't installed"
+    elif [[ "$v" == *.twa ]]; then bad "Gmail is the WEB-ONLY version ($v): no alerts while closed, alerts vanish after ~7 s"
+    else ok "Gmail is the full app ($v)"; fi
+    granted com.google.android.gm && ok "Gmail may show notifications" || bad "Gmail notifications are OFF"
+    unrestricted com.google.android.gm && ok "Gmail battery: Unrestricted" || bad "Gmail battery: restricted"
+    echo "Gmail notification categories (4/5 = pops up, 0 = off):"
+    sh "dumpsys notification" | awk 'index($0,"AppSettings: com.google.android.gm ("){f=1;next} f&&/AppSettings: /{f=0} f' \
+        | grep -o -E "NotificationChannel\{mId='[^']*', mName=[^,]*, mDescription=[^,]*, mImportance=[0-9]+" \
+        | sed -E "s/NotificationChannel\{mId='([^']*)'.*mImportance=([0-9]+)/    \2  \1/; s/com.google.android.libraries.communications.conference./Meet:/" | sort -rn
+    echo "Other apps:"
+    for p in com.android.chrome $EXTRA_PACKAGES; do
+        granted $p && ok "$p may show notifications" || bad "$p notifications are OFF"
+    done
+    for p in com.android.chrome $EXTRA_PACKAGES; do
+        unrestricted $p && ok "$p battery: Unrestricted" || bad "$p battery: restricted"
+    done
+    echo "Notification Keeper:"
+    if installed $KEEPER; then
+        ok "installed"
+        listener_on && ok "notification access on" || bad "notification access OFF"
+        companion_on && ok "companion link on (restores Gmail's notification settings)" || bad "companion link missing"
+        granted $KEEPER && ok "may show notifications" || bad "notifications are OFF"
+    else
+        bad "not installed"
+    fi
+    echo "Reminder: keep 'Enable auto update' OFF for Gmail in the Play Store."
+}
+
+# ---- apply ---------------------------------------------------------------------------------------
+apply() {
+    echo "Gmail:"
+    local v; v=$(gmail_version)
+    if [ -z "$v" ] || [[ "$v" == *.twa ]]; then
+        if [ -z "$GMAIL_APK" ] || [ ! -r "$GMAIL_APK" ]; then
+            bad "Gmail is the web-only version and no full Gmail APK was given (GMAIL_APK; optional with Gmail Go)"
+        elif ! cert_ok "$GMAIL_APK"; then
+            bad "The saved Gmail file isn't signed by Google, so it will NOT be installed."
+        else
+            info "installing the full Gmail app (verified Google signature)..."
+            if timeout 600 adb install -r --user $U "$GMAIL_APK" 2>&1 | tail -1 | grep -q Success; then
+                ok "full Gmail installed ($(gmail_version))"
+                info "If Gmail now opens and closes immediately, run:  notif-restore gmail-reset"
+            else
+                bad "install failed (a newer web version may be installed; a newer full Gmail APK is needed)"
+            fi
+        fi
+    else
+        ok "Gmail is already the full app ($v)"
+    fi
+    for p in com.google.android.gm com.android.chrome $EXTRA_PACKAGES; do
+        installed $p || continue
+        granted $p || { sh "pm grant --user $U $p android.permission.POST_NOTIFICATIONS" >/dev/null; info "turned notifications on for $p"; }
+    done
+    for p in com.google.android.gm com.android.chrome $EXTRA_PACKAGES; do
+        installed $p || continue
+        if ! unrestricted $p; then
+            sh "cmd deviceidle whitelist +$p" >/dev/null
+            sh "cmd appops set --user $U $p RUN_ANY_IN_BACKGROUND allow" >/dev/null
+            info "set battery to Unrestricted for $p"
+        fi
+    done
+
+    echo "Notification Keeper:"
+    if ! installed $KEEPER; then
+        local apk="$KIT/NotificationKeeper.apk"; [ -r "$KEEPER_APK_SRC" ] && apk=$KEEPER_APK_SRC
+        timeout 120 adb install -r --user $U "$apk" 2>&1 | tail -1 | grep -q Success && ok "installed" || bad "install failed"
+    fi
+    granted $KEEPER || sh "pm grant --user $U $KEEPER android.permission.POST_NOTIFICATIONS" >/dev/null
+    sh "cmd appops set --user $U $KEEPER AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore" >/dev/null
+    companion_on || { sh "cmd companiondevice associate $U $KEEPER $KEEPER_MAC" >/dev/null; info "companion link created"; }
+    if listener_on; then
+        # Reconnect so the Keeper re-checks Gmail's categories right away.
+        sh "cmd notification disallow_listener $LISTENER $U" >/dev/null
+    fi
+    sleep 1
+    sh "cmd notification allow_listener $LISTENER $U" >/dev/null
+    sleep 3
+    echo
+    status
+}
+
+gmail_reset() {
+    echo "This clears Gmail's app data on this Googlebook once (cached mail + Gmail's internal settings)."
+    echo "Your email stays on Google's servers; Notification Keeper puts all Gmail notification settings back."
+    companion_on && listener_on || { echo "Notification Keeper isn't fully set up. Run 'notif-restore' first."; exit 1; }
+    local answer=""
+    read -r -p "Type YES to clear Gmail's app data on the Googlebook: " answer
+    [ "$answer" = "YES" ] || { echo "Cancelled. Nothing was changed."; exit 1; }
+    timeout 60 adb -s "$ANDROID_SERIAL" shell pm clear --user $U com.google.android.gm
+    echo "Now open Gmail and tap 'Take me to Gmail'."
+}
+
+pick_device
+case "$MODE" in
+    status) status ;;
+    apply) apply ;;
+    gmail-reset) gmail_reset ;;
+esac

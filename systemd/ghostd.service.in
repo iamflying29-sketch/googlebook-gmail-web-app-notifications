@@ -1,0 +1,21 @@
+[Unit]
+Description=Gmail Ghost daemon - instant background Mark-as-read for Notification Keeper
+After=default.target
+
+# setup.sh fills in __ROOT__ (this repository's folder) and __UID__ (your user ID).
+# The Googlebook's adb address is read by ghostd.py from __ROOT__/ghost.env (ANDROID_SERIAL=IP:PORT).
+[Service]
+Type=simple
+WorkingDirectory=__ROOT__
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+Environment=PATH=/usr/bin:/bin:/usr/local/bin
+ExecStart=__ROOT__/venv/bin/python __ROOT__/ghostd.py --adb
+Restart=always
+RestartSec=5
+# Exit status 2 means ANDROID_SERIAL is not configured: do not restart until it is fixed.
+RestartPreventExitStatus=2
+MemoryMax=1500M
+
+[Install]
+WantedBy=default.target
