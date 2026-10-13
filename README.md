@@ -264,8 +264,8 @@ notifications.
 **Turn off automatic updates for Gmail Go.** A Play Store update to a 2022 or later build would block its
 notifications. If Google Play shows Gmail Go for your Googlebook, open its page in Play, open the three-dot menu and
 turn off **Enable auto update**. If Play does not list Gmail Go for your device, there is no page to change, and
-Notification Keeper warns you with "Gmail notifications stopped working" if Gmail Go is ever removed or can no
-longer post notifications.
+Notification Keeper warns you with "Gmail notifications stopped working" if Gmail Go can no longer post
+notifications. It does not warn you if Gmail Go is removed, but its status window shows that Gmail Go is missing.
 
 ### Step 4. Build Notification Keeper
 
