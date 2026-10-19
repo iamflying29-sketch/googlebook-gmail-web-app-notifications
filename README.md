@@ -398,10 +398,14 @@ address). Without that argument, they try the address in `ADB_PORT_FILE`.
 
 ### Configuration
 
-- **`ghost.env`** holds the Googlebook's address as `ANDROID_SERIAL=<GOOGLEBOOK_IP>:<PORT>`. `setup.sh` writes it,
-  and `ghost.env.example` shows the format. `ghostd.py` and `ghostctl` use it unless the `ANDROID_SERIAL` environment
-  variable is set, which takes precedence. The daemon reads the file again every time its adb connection restarts, so
-  a new port takes effect without restarting the service.
+- **The Googlebook's address.** The port changes on every Wi-Fi re-join, so the daemon follows it. If you run the
+  [Sleep Guard](https://github.com/iamflying29-sketch/googlebook-sleep-guard) or
+  [Shadow Trackpad Fix](https://github.com/iamflying29-sketch/googlebook-shadow-trackpad-fix) helpers, they republish
+  the current address and the daemon reads the newest file automatically, so Mark as read keeps working across
+  Wi-Fi re-joins with nothing to do. Without those helpers, the daemon uses the `ANDROID_SERIAL` environment
+  variable, or `ghost.env` (`ANDROID_SERIAL=<GOOGLEBOOK_IP>:<PORT>`, which `setup.sh` writes and `ghost.env.example`
+  shows the format of). It re-reads the address on every reconnect, so a new port takes effect without restarting
+  the service.
 - **`notif-restore`** reads these optional environment variables: `ANDROID_USER` (your Android user ID, default 10),
   `KEEPER_APK` (default `~/googlebook-notification-keeper/NotificationKeeper.apk`), `NOTIF_KIT` (a folder with spare
   APKs, default `~/notification-keeper-kit`, used for `NotificationKeeper.apk` when `KEEPER_APK` does not exist),
@@ -450,18 +454,18 @@ the full Gmail app; for this setup, keep auto-updates off for Gmail Go.
   the newer one (`adb shell pm uninstall --user <USER_ID> com.google.android.gm.lite`; your mail stays on Google's
   servers) and repeat [step 3](#step-3-install-and-set-up-gmail-go).
 - **Wireless debugging port:** the port changes when Wireless debugging restarts, for example after a reboot or
-  after the Wi-Fi drops in deep sleep. Mark as read then stops until the daemon has the new address. Put the new
-  address in `ghost.env`. The daemon reads the file again whenever its adb connection restarts, which happens by
-  itself when the old connection drops, so you do not need to restart the service. If you use Shadow Trackpad Fix,
-  which publishes the current address, you can copy it from there:
+  after the Wi-Fi drops in deep sleep. If you run [Sleep Guard](https://github.com/iamflying29-sketch/googlebook-sleep-guard)
+  or [Shadow Trackpad Fix](https://github.com/iamflying29-sketch/googlebook-shadow-trackpad-fix), each publishes the
+  current address (`/mnt/shared/Documents/Sleep Guard/adb-port.txt` and
+  `/mnt/shared/Documents/Shadow Trackpad Fix/adb-port.txt`), the daemon reads the newest one and reconnects on its
+  own, so Mark as read keeps working with nothing to do. Without either helper, put the new address in `ghost.env`:
 
   ```bash
-  echo "ANDROID_SERIAL=$(awk '{print $1; exit}' "/mnt/shared/Documents/Shadow Trackpad Fix/adb-port.txt")" \
-      > ~/googlebook-gmail-web-app-notifications/ghost.env
+  echo "ANDROID_SERIAL=<GOOGLEBOOK_IP>:<PORT>" > ~/googlebook-gmail-web-app-notifications/ghost.env
   ```
 
-  [Sleep Guard](https://github.com/iamflying29-sketch/googlebook-sleep-guard) publishes the same kind of file in
-  `/mnt/shared/Documents/Sleep Guard/adb-port.txt`.
+  The daemon re-reads the address whenever its adb connection restarts, which happens by itself when the old
+  connection drops, so you do not need to restart the service.
 - **GooglebookOS updates:** a big update could switch off notification access or the accessibility service. Run
   `bin/notif-restore apply` for the Keeper's permissions, turn the Gmail helper back on by hand (step 6), and run
   `./ghostctl doctor`. Notification Keeper also posts an alert if it loses its notification access.

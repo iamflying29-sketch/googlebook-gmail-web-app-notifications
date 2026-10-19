@@ -7,10 +7,13 @@ commands the Notification Keeper logs under the tag GmailGhostCmd. Without --adb
 command folder bridge/cmd/ instead (a testing mode). For each command it marks the exact email read
 in a hidden, already-logged-in Chromium - no window, no screen touching.
 
-The Googlebook's adb serial (the Wireless debugging IP:PORT) comes from the ANDROID_SERIAL
-environment variable or, if that is not set, from the line ANDROID_SERIAL=IP:PORT in the file
-ghost.env next to this script (setup.sh writes it). The file is read again every time the adb
-stream is restarted, so a new port can be put there without restarting the daemon.
+The Googlebook picks a new Wireless debugging port every time it re-joins Wi-Fi, so the daemon
+follows the address on its own and reconnects when the port moves. If you also run the Sleep Guard or
+Shadow Trackpad Fix helpers (separate projects), they republish the current address to a shared file
+and the daemon reads the newest one. Otherwise it uses the ANDROID_SERIAL environment variable, or the
+line ANDROID_SERIAL=IP:PORT in the file ghost.env next to this script (setup.sh writes it). The address
+is read again on every reconnect, so Mark as read keeps working across Wi-Fi re-joins without anyone
+editing anything.
 
 Design rules (never block / never hang):
   - one warm headless Chromium per account, reused for speed, closed after it's idle a while
@@ -56,6 +59,86 @@ def android_serial():
     except OSError:
         pass
     return serial
+
+
+# The Googlebook picks a NEW Wireless debugging port on every Wi-Fi re-join. These optional files are
+# where the Sleep Guard and Shadow Trackpad Fix helper projects republish the current address; if you
+# run either helper, the daemon reads the newest file and follows the port automatically. Without them
+# it falls back to ANDROID_SERIAL (environment or ghost.env), which you keep current yourself.
+ADDRESS_FILES = (
+    "/mnt/shared/Documents/Sleep Guard/adb-port.txt",
+    "/mnt/shared/Documents/Shadow Trackpad Fix/adb-port.txt",
+)
+_last_serial = ""
+_adb_failures = 0
+_last_reset = 0.0
+
+
+def current_serial():
+    """The Googlebook's adb address: the newest helper port file if present, else ANDROID_SERIAL from
+    the environment or ghost.env, else the last address we used (so a half-written file never drops us
+    back to nothing)."""
+    global _last_serial
+    found = []
+    for f in ADDRESS_FILES:
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                a = fh.read(100).split()[0]
+            if re.match(r"^[\w.\-]+:\d+$", a):
+                found.append((os.path.getmtime(f), a))
+        except (OSError, IndexError):
+            pass
+    if found:
+        found.sort(reverse=True)
+        _last_serial = found[0][1]
+        return _last_serial
+    configured = android_serial()
+    if configured:
+        _last_serial = configured
+    return _last_serial
+
+
+def _device_online(serial):
+    try:
+        r = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10)
+        for line in (r.stdout or "").splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == serial and parts[1] == "device":
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def ensure_connected(serial):
+    """Make sure the shared adb server is connected to the Googlebook at this address. Connects if not,
+    and after several failures in a row restarts the adb server once (throttled), which is sometimes the
+    only way it accepts a new port after Wi-Fi re-joins."""
+    global _adb_failures, _last_reset
+    if _device_online(serial):
+        _adb_failures = 0
+        return True
+    now = time.time()
+    if _adb_failures >= 3 and now - _last_reset > 60:
+        try:
+            subprocess.run(["adb", "kill-server"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15)
+        except Exception:
+            pass
+        _last_reset = now
+        _adb_failures = 0
+        log("restarted the adb server because it kept refusing the Googlebook's new port")
+    try:
+        r = subprocess.run(["adb", "connect", serial], capture_output=True, text=True, timeout=15)
+        out = r.stdout or ""
+        ok = "connected" in out and "unable" not in out and "failed" not in out
+    except Exception:
+        ok = False
+    if ok and _device_online(serial):
+        _adb_failures = 0
+        return True
+    _adb_failures += 1
+    return False
 
 
 def log(msg):
@@ -315,33 +398,43 @@ def process(browsers, cmd):
 def run_adb(browsers, serial):
     """Listen for commands on the Keeper's logcat tag over adb; mark read as they arrive.
 
-    Supervised: if the adb stream drops it is restarted (with the serial read again from ghost.env);
-    commands are deduped by id and stale ones ignored; an idle browser is closed after a while.
+    Supervised: it follows the Googlebook's address (the port changes on every Wi-Fi re-join),
+    reconnects on its own when the stream drops or the port moves, and after repeated failures resets
+    the adb server. Commands are deduped by id and stale ones ignored; an idle browser is closed.
     """
     seen = set()
     jsonre = re.compile(r"\{.*\}")
-    # Always-on service: listens forever, reconnecting adb if it drops; the browser still sleeps when
-    # idle (close_idle). Supervised by systemd (Restart=always) in a real install.
+    # Always-on service: listens forever, following the port and reconnecting when it moves; the browser
+    # still sleeps when idle (close_idle). Supervised by systemd (Restart=always) in a real install.
     while True:
-        serial = android_serial() or serial  # re-read ghost.env on every (re)connect
-        try:
-            subprocess.run(["adb", "-s", serial, "connect", serial],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-        except Exception:
-            pass
-        # -T 1: start near 'now' so we don't replay the whole buffer; stale/dedupe guards do the rest.
-        # stdbuf -oL forces line-buffering so commands arrive instantly (adb block-buffers a pipe).
+        serial = current_serial()
+        if not serial:
+            log("no Googlebook address yet (set ANDROID_SERIAL or ghost.env, or run a helper); waiting")
+            time.sleep(5)
+            continue
+        if not ensure_connected(serial):
+            log("waiting for the Googlebook (adb could not connect to " + serial + ")")
+            time.sleep(5)
+            continue
+        # -T 200: on each (re)connect, replay the last command lines from the device's own log buffer,
+        # so a tap that landed during a brief reconnect is still handled. The tag is filtered (only our
+        # commands), and the dedupe set plus the 120 s stale filter stop anything old or already-handled
+        # from running again. stdbuf -oL forces line-buffering so commands arrive instantly.
         proc = subprocess.Popen(
-            ["stdbuf", "-oL", "-eL", "adb", "-s", serial, "logcat", "-s", LOGCAT_TAG + ":I", "-T", "1"],
+            ["stdbuf", "-oL", "-eL", "adb", "-s", serial, "logcat", "-s", LOGCAT_TAG + ":I", "-T", "200"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         log("listening on adb logcat tag " + LOGCAT_TAG + " (" + serial + ")")
         try:
             while True:
-                # poll with a timeout so we can close an idle browser even when no commands arrive
-                ready, _, _ = select.select([proc.stdout], [], [], 15)
+                # poll with a timeout so we can close an idle browser and notice a port move
+                ready, _, _ = select.select([proc.stdout], [], [], 5)
                 if not ready:
                     browsers.close_idle()
                     if proc.poll() is not None:
+                        break
+                    live = current_serial()
+                    if live and live != serial:
+                        log("adb address changed to " + live + ", reconnecting")
                         break
                     continue
                 line = proc.stdout.readline()
@@ -381,11 +474,11 @@ def main():
     once = "--once" in sys.argv
     adb_mode = "--adb" in sys.argv
     if adb_mode:
-        serial = android_serial()
+        serial = current_serial()
         if not serial:
-            log("ANDROID_SERIAL is not set: put the line ANDROID_SERIAL=IP:PORT (your Wireless debugging "
-                "address) in " + CONFIG + " or set the ANDROID_SERIAL environment variable (see README)")
-            sys.exit(2)
+            log("no Googlebook address found yet: set ANDROID_SERIAL or the line ANDROID_SERIAL=IP:PORT "
+                "in " + CONFIG + ", or run the Sleep Guard / Shadow Trackpad Fix helper (see README). "
+                "Waiting for one to appear.")
         log("ghostd started (adb logcat mode)")
         with sync_playwright() as pw:
             browsers = Browsers(pw)
