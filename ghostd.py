@@ -395,12 +395,30 @@ def process(browsers, cmd):
         return {"ok": False, "detail": "error: " + repr(e)[:160]}
 
 
+HEARTBEAT_AFTER_SILENCE = 25   # seconds of no logcat lines before checking the reader is still alive
+HEARTBEAT_TIMEOUT = 12         # seconds to see our own marker come back before treating the reader as stalled
+
+
+def send_heartbeat(serial):
+    """Write a tiny marker line to the device log under our tag, so a healthy reader reads it straight
+    back. Plain text, never JSON, so the device shell cannot mangle it and it is never taken for a
+    command. Returns the token, or None if even the write failed (which itself means the link is down)."""
+    token = "hbPING" + str(time.time_ns())
+    try:
+        subprocess.run(["adb", "-s", serial, "shell", "log", "-p", "i", "-t", LOGCAT_TAG, token],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        return token
+    except Exception:
+        return None
+
+
 def run_adb(browsers, serial):
     """Listen for commands on the Keeper's logcat tag over adb; mark read as they arrive.
 
     Supervised: it follows the Googlebook's address (the port changes on every Wi-Fi re-join),
     reconnects on its own when the stream drops or the port moves, and after repeated failures resets
-    the adb server. Commands are deduped by id and stale ones ignored; an idle browser is closed.
+    the adb server. A stall watchdog also restarts the reader when the stream stays open but stops
+    delivering (the process is alive yet deaf). Commands are deduped by id and stale ones ignored.
     """
     seen = set()
     jsonre = re.compile(r"\{.*\}")
@@ -424,10 +442,14 @@ def run_adb(browsers, serial):
             ["stdbuf", "-oL", "-eL", "adb", "-s", serial, "logcat", "-s", LOGCAT_TAG + ":I", "-T", "200"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         log("listening on adb logcat tag " + LOGCAT_TAG + " (" + serial + ")")
+        last_rx = time.time()      # when we last read ANY line from the stream
+        hb_pending = False         # a heartbeat marker was written and we are waiting to read it back
+        hb_sent_at = 0.0
         try:
             while True:
                 # poll with a timeout so we can close an idle browser and notice a port move
                 ready, _, _ = select.select([proc.stdout], [], [], 5)
+                now = time.time()
                 if not ready:
                     browsers.close_idle()
                     if proc.poll() is not None:
@@ -436,10 +458,29 @@ def run_adb(browsers, serial):
                     if live and live != serial:
                         log("adb address changed to " + live + ", reconnecting")
                         break
+                    # Stall watchdog. The process is alive, but the stream may have gone deaf. After a
+                    # quiet spell, drop a marker on the device log and require it to come back through
+                    # THIS stream. If it does not, the reader has stalled, so restart it (the outer loop
+                    # reconnects). This restarts only the logcat reader, never the daemon or adb server.
+                    if hb_pending:
+                        if now - hb_sent_at > HEARTBEAT_TIMEOUT:
+                            log("logcat reader stalled (heartbeat not seen in %ds); restarting it" % HEARTBEAT_TIMEOUT)
+                            break
+                    elif now - last_rx > HEARTBEAT_AFTER_SILENCE:
+                        token = send_heartbeat(serial)
+                        if token is None:
+                            log("heartbeat could not be written; restarting the logcat reader")
+                            break
+                        hb_pending = True
+                        hb_sent_at = now
                     continue
                 line = proc.stdout.readline()
                 if not line:
                     break  # stream ended; outer loop restarts it
+                last_rx = now
+                hb_pending = False          # any line proves the stream is alive
+                if "hbPING" in line:
+                    continue                # our own liveness marker, not a command
                 m = jsonre.search(line)
                 if not m:
                     continue
@@ -447,6 +488,8 @@ def run_adb(browsers, serial):
                     cmd = json.loads(m.group(0))
                 except Exception:
                     continue
+                if cmd.get("op") == "heartbeat":
+                    continue                # ignore a JSON heartbeat too, just in case
                 cid = cmd.get("id") or m.group(0)
                 if cid in seen:
                     continue
@@ -458,7 +501,6 @@ def run_adb(browsers, serial):
                 log("cmd via logcat: " + json.dumps(cmd)[:160])
                 result = process(browsers, cmd)
                 log("  -> " + json.dumps(result)[:200])
-                last_activity = time.time()
                 browsers.close_idle()
         finally:
             try:
