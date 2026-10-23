@@ -412,6 +412,72 @@ def send_heartbeat(serial):
         return None
 
 
+# The durable command queue in the shared Documents folder. The Keeper writes each Mark-as-read here
+# too (via MediaStore), and we drain it whenever we run, with NO time limit, so a tap survives a Wi-Fi
+# outage, the adb port moving, a daemon restart or a reboot. Processed files are MOVED aside, never
+# deleted. The logcat tag stays the instant path; this folder is the backstop that cannot drop one.
+SHARED_CMD = "/mnt/shared/Documents/Notification Keeper/cmd"
+SHARED_PROCESSED = "/mnt/shared/Documents/Notification Keeper/processed"
+
+
+FILE_RETRY_EVERY = 60          # seconds between retries of a file command that failed (never hammer)
+FILE_GIVE_UP_AFTER = 86400     # seconds (24 h): stop retrying a command older than this
+
+
+def drain_cmd_folder(browsers, seen, last_try):
+    try:
+        names = sorted(f for f in os.listdir(SHARED_CMD) if f.endswith(".json"))
+    except OSError:
+        return  # the folder is not there yet (no command has ever been written)
+    now = time.time()
+    for name in names:
+        path = os.path.join(SHARED_CMD, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                cmd = json.load(fh)
+        except Exception:
+            cmd = None
+        done = False
+        if not isinstance(cmd, dict):
+            done = True                        # unreadable: file it away so we never look at it again
+        else:
+            cid = cmd.get("id") or name
+            if cid in seen:
+                done = True                    # already handled (the logcat path got there first)
+            elif now - last_try.get(cid, 0) < FILE_RETRY_EVERY:
+                pass                           # backed off after a recent failure: leave it, try later
+            else:
+                last_try[cid] = now
+                # No stale-time check: the whole point of the file is that a command the daemon missed
+                # still runs, however long ago it was tapped.
+                log("cmd via file " + name + ": " + json.dumps(cmd)[:160])
+                try:
+                    result = process(browsers, cmd)
+                except Exception as e:
+                    result = {"ok": False, "detail": "error: " + repr(e)[:140]}
+                log("  -> " + json.dumps(result)[:200])
+                detail = str(result.get("detail", ""))
+                if result.get("ok"):
+                    seen.add(cid)
+                    if len(seen) > 1000:
+                        seen.clear(); seen.add(cid)
+                    last_try.pop(cid, None)
+                    done = True
+                elif "not set up" in detail or "not signed in" in detail or "no profile" in detail:
+                    log("giving up on " + name + ": account not set up")
+                    done = True                # non-retryable, do not loop on it
+                elif cmd.get("ts") and now - cmd["ts"] / 1000.0 > FILE_GIVE_UP_AFTER:
+                    log("giving up on " + name + ": older than a day and still failing")
+                    done = True
+                # else: a transient failure (network or browser); leave the file and retry after backoff
+        if done:
+            try:
+                os.makedirs(SHARED_PROCESSED, exist_ok=True)
+                os.replace(path, os.path.join(SHARED_PROCESSED, name))  # MOVE aside, never delete
+            except OSError as e:
+                log("could not move processed command file " + name + ": " + repr(e)[:100])
+
+
 def run_adb(browsers, serial):
     """Listen for commands on the Keeper's logcat tag over adb; mark read as they arrive.
 
@@ -421,10 +487,12 @@ def run_adb(browsers, serial):
     delivering (the process is alive yet deaf). Commands are deduped by id and stale ones ignored.
     """
     seen = set()
+    last_try = {}  # cid -> last time a failing file command was tried, so we back off and never hammer
     jsonre = re.compile(r"\{.*\}")
     # Always-on service: listens forever, following the port and reconnecting when it moves; the browser
     # still sleeps when idle (close_idle). Supervised by systemd (Restart=always) in a real install.
     while True:
+        drain_cmd_folder(browsers, seen, last_try)  # durable backstop; runs even while adb is down
         serial = current_serial()
         if not serial:
             log("no Googlebook address yet (set ANDROID_SERIAL or ghost.env, or run a helper); waiting")
@@ -452,6 +520,7 @@ def run_adb(browsers, serial):
                 now = time.time()
                 if not ready:
                     browsers.close_idle()
+                    drain_cmd_folder(browsers, seen, last_try)  # the durable backstop, checked every idle tick
                     if proc.poll() is not None:
                         break
                     live = current_serial()
