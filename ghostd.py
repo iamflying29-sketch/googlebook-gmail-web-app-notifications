@@ -561,15 +561,23 @@ def run_adb(browsers, serial):
                     continue                # ignore a JSON heartbeat too, just in case
                 cid = cmd.get("id") or m.group(0)
                 if cid in seen:
-                    continue
+                    continue                  # already marked read successfully
                 if cmd.get("ts") and time.time() - cmd["ts"] / 1000.0 > STALE_CMD_SECONDS:
-                    continue
-                seen.add(cid)
-                if len(seen) > 500:
-                    seen.clear(); seen.add(cid)
+                    continue                  # too old for the fast path; the durable file still retries it
+                if time.time() - last_try.get(cid, 0) < FILE_RETRY_EVERY:
+                    continue                  # backed off after a recent failure; do not hammer
+                last_try[cid] = time.time()
                 log("cmd via logcat: " + json.dumps(cmd)[:160])
                 result = process(browsers, cmd)
                 log("  -> " + json.dumps(result)[:200])
+                # Mark it handled ONLY once the mark-read truly worked. A failure (a browser hiccup, a
+                # port gap) leaves it unseen, so the durable file in the shared folder retries it instead
+                # of the command being thrown away. This was the hole that lost a tap after a reboot.
+                if result.get("ok"):
+                    seen.add(cid)
+                    if len(seen) > 500:
+                        seen.clear(); seen.add(cid)
+                    last_try.pop(cid, None)
                 browsers.close_idle()
         finally:
             try:
