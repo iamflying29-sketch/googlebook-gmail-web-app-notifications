@@ -4,9 +4,9 @@ Real, lasting Gmail notifications for the Gmail web app on a Lenovo Googlebook 1
 Gmail is completely closed. Each new email pops up, stays in the Notification Center until you deal with it, and has
 three working buttons: Reply, Delete and Mark as read. The system is built from four parts: Google's Gmail Go app as
 the push engine, the [Notification Keeper](https://github.com/iamflying29-sketch/googlebook-notification-keeper)
-app, an accessibility helper inside Notification Keeper, and a small background service in the Linux Terminal. This
-repository holds the Linux Terminal service, its account tools and a recovery script, and it is the complete setup
-guide for the whole system, in order.
+app, an accessibility helper inside Notification Keeper, and a small background service, the ghost, that runs on
+GooglebookOS itself. This repository holds the ghost, the scripts and the small app that run it on the Googlebook,
+its account tools and a recovery script, and it is the complete setup guide for the whole system, in order.
 
 ## What it does
 
@@ -22,9 +22,11 @@ It has four parts:
 | Gmail Go, 2021 version | GooglebookOS | Receives Google's push messages and syncs new mail. It works only as the engine, and its own notifications are kept silent. |
 | Notification Keeper | GooglebookOS | Turns each Gmail Go alert into a proper notification, removes duplicates, and guards Gmail's notification settings. |
 | Gmail helper (an accessibility service inside Notification Keeper) | GooglebookOS | Carries out a tap, Reply or Delete in the Gmail web app window. |
-| Ghost daemon (`ghostd.py`, this repository) | Linux Terminal | Handles Mark as read in a hidden browser, without opening any window. |
+| Ghost daemon (`ghostd.py`, this repository) | GooglebookOS, as the adb shell user, kept running by the small Gmail Ghost app | Handles Mark as read in a hidden browser, without opening any window and without the Linux Terminal. |
 
-This repository contains the ghost daemon, its tools and the recovery script `notif-restore`. Notification Keeper
+This repository contains the ghost daemon, the scripts and the Gmail Ghost app that run it on the Googlebook, its
+tools and the recovery script `notif-restore`. You still use the Linux Terminal once, to set everything up and to
+sign in to each Gmail account. Notification Keeper
 and its Gmail helper live in their own repository. Gmail Go is Google's app, and you get it yourself, as explained
 in [Getting Gmail Go](#getting-gmail-go).
 
@@ -101,18 +103,24 @@ Mark as read could not be done on the Android side. Gmail Go's mark-as-read need
 apps can hold, the adb shell has no secure web client, and Gmail retired its Basic HTML view in January 2024. Google
 also blocks sign-in inside embedded app browsers. A real Chromium browser in the Linux Terminal is not an embedded
 browser, so I sign in to each Gmail account there once, and the session keeps working in a hidden (headless)
-browser afterwards.
+browser afterwards. That same browser, with its saved sign-ins, then runs on GooglebookOS itself, as explained in
+[section 5](#5-the-ghost-runs-on-googlebookos-itself).
 
 The Mark as read button works like this:
 
 1. Notification Keeper writes one JSON line to the Android system log (logcat) under the tag `GmailGhostCmd`. It
    holds the account, the sender's email address, the subject and the arrival time. The Keeper removes its
    notification at the same moment.
-2. The ghost daemon in the Linux Terminal (`ghostd.py --adb`, run by a systemd user service) listens with
-   `adb logcat` over Wireless debugging. It runs adb through `stdbuf` because adb otherwise buffers its output into
-   the pipe, which delayed commands by about a minute. It skips duplicate commands and ignores any command older
-   than 120 seconds. I used logcat as the bridge because the Linux Terminal's shared folder is not visible to the adb
-   shell.
+2. The ghost daemon (`ghostd.py --device`) runs on the Googlebook itself as the adb shell user, so it reads the
+   system log directly, with no adb connection and no Wireless debugging port in between. Android's `logcat` holds
+   its output back when it writes into a pipe, so the daemon gives it a pseudo terminal instead, which makes every
+   line arrive the moment it is logged. It skips duplicate commands and ignores any command older than 120 seconds.
+   The Keeper also saves each command as a small file in `Documents/Notification Keeper/cmd/`. The daemon checks that
+   folder through Android's media storage when it starts and once a minute, so a tap made while the ghost was
+   restarting still runs. It moves each handled file to `Documents/Notification Keeper/processed/` and never deletes
+   one. (On a Linux computer the daemon can also run with `--adb` and listen with `adb logcat` over Wireless
+   debugging, which is how it first ran in the Linux Terminal. There it runs adb through `stdbuf`, because adb
+   otherwise holds back its output in the pipe.)
 3. It uses a warm headless Chromium that is signed in to that account (one browser profile per account), opens the
    Inbox and presses Gmail's own Refresh.
 4. It finds the unread row whose sender address matches, whose subject matches exactly (again ignoring "Re:" and
@@ -128,19 +136,56 @@ browser that fails is closed and started fresh for the next command.
 Accounts are tied to Gmail Go's notification settings. When a Gmail account's mail category in Gmail Go is turned on,
 the Keeper asks the daemon to set that account up, and the daemon opens the one-time sign-in window if the account
 has no browser profile yet. When the category is turned off, the daemon closes that account's browser and moves its
-profile aside.
+profile aside. On the Googlebook the ghost cannot open a sign-in window, so there it says in its log that the account
+is not set up, and you sign the account in on Linux and copy its profile over (see
+[step 9](#step-9-move-the-ghost-onto-the-googlebook)).
+
+### 5. The ghost runs on GooglebookOS itself
+
+At first the ghost ran in the Linux Terminal, and that was not reliable. The Linux Terminal stops its Linux system
+whenever its last window closes, Android sometimes closes the Terminal app when memory runs low, and when I made the
+Keeper open the Terminal for each tap, the Linux system shut down again about ten seconds later. So the ghost now
+runs on GooglebookOS itself.
+
+The Googlebook has an x86-64 Intel processor, the same kind as the Linux system, so the Linux programs the ghost uses
+run there natively. `googlebook/build-runtime.sh` gathers them into one folder of about 490 MB: the same Python,
+Playwright and headless Chromium, every library they need, and two font families. Three things that Linux programs
+expect do not exist on Android, so the build adjusts for them:
+
+- Android has no Linux program loader in `/lib64`. Chromium is pointed at the runtime's own loader with `patchelf`,
+  and Python and Playwright's node are started through that loader, because `patchelf` damages those two programs.
+- Android has no `/etc/resolv.conf`, the file that tells Linux programs which DNS servers to ask. The runtime's own
+  copy of the C library reads `/sdcard/.ggdns` instead. The supervisor writes that file at every start, with the
+  Googlebook's current DNS servers first and Google's and Cloudflare's public DNS servers as a fallback.
+- Fonts, temporary files, the time zone (UTC, as on Linux) and the home folder are set in
+  `googlebook/device/env.sh`.
+
+`googlebook/install-on-googlebook.sh` copies the runtime, your signed-in browser profiles (without their lock files
+and caches) and the ghost's files into `/data/local/tmp/gmailghost` on the Googlebook. Only the adb shell user can
+read that folder. The supervisor `googlebook/device/ghost.sh` starts the ghost, starts it again whenever it stops
+(waiting a little longer after each quick failure), and restarts it if it has not reported that it is alive for 5
+minutes.
+
+Everything that runs as the adb shell user ends when the Googlebook restarts, so the small Gmail Ghost app
+(`gmail-ghost-app/`, written in Kotlin) starts the supervisor again. It has its own paired Wireless debugging key and
+connects to the Googlebook's own Wireless debugging, finding the current port by itself. After every restart, and
+every 15 minutes, it runs `ghost.sh ensure`. When the ghost's files inside the app are newer than the ones on the
+Googlebook, it installs them and restarts the ghost. It shows a notification if the ghost has not been running for 30
+minutes.
 
 ### Proof
 
 Every part was proven on October 12, 2026, including notifications with Gmail Go closed, Mark as read on more
-than one account, and tap, Reply and Delete. Archive was left out because Android shows at most three buttons on a
-notification. Mark as read currently needs the Linux Terminal running with Wireless debugging, and it works for
-Gmail accounts only (@gmail.com, and the code also accepts @googlemail.com).
+than one account, and tap, Reply and Delete. Mark as read on GooglebookOS itself, with the Linux Terminal out of the
+picture, was proven on November 3, 2026: my test email was marked read 6 seconds after I pressed the button. Archive
+was left out because Android shows at most three buttons on a notification. Mark as read works for Gmail accounts
+only (@gmail.com, and the code also accepts @googlemail.com).
 
 ## Requirements
 
 - **Device:** a Lenovo Googlebook 15 (x86-64 Intel). I built and tested this on GooglebookOS build
-  CL3B.260622.271.R1 (Android 17), with the Linux Terminal running Debian 13 (trixie).
+  CL3B.260622.271.R1 (Android 17), with the Linux Terminal running Debian 13 (trixie). The ghost on GooglebookOS
+  itself was built and tested on build CL3B.260622.276.R5.
 - **General setup:** Developer options, the Linux Terminal, adb, a paired Wireless debugging connection, your Android
   user ID, and the Android SDK build tools with a JDK. All of this is in the shared
   [Getting started guide](https://github.com/iamflying29-sketch/googlebook-projects/blob/main/GETTING-STARTED.md).
@@ -153,13 +198,19 @@ Gmail accounts only (@gmail.com, and the code also accepts @googlemail.com).
 - **In the Linux Terminal:** Python 3 with the `venv` module, `git`, `stdbuf` (part of coreutils), a systemd user
   session, and the ability to show a window on the Googlebook screen (used once per account for signing in). The
   setup script installs Playwright and the Chromium build it drives into this folder and into Playwright's download
-  cache.
+  cache. Moving the ghost onto the Googlebook (step 9) also needs `patchelf` (`sudo apt install patchelf`), about
+  1 GB of free space on the Linux side for the build and its archive, and about 500 MB on the Googlebook. Building
+  the Gmail Ghost app needs the Android SDK build tools 35.0.0 with the android-35 platform in `~/tools/android-sdk`
+  (or set `ANDROID_SDK`) and JetBrains' Kotlin command-line compiler unpacked so that
+  `~/tools/kotlin/kotlinc/bin/kotlinc` exists (or set `KOTLIN_HOME`).
 - **Accounts:** I built and tested this with Gmail accounts. Mark as read works for @gmail.com accounts (the code
   also accepts @googlemail.com), and tap, Reply and Delete need the account to be signed in to the Gmail web app.
 - **Permissions used on GooglebookOS:** for Gmail Go, the notification permission, a battery whitelist entry and
   background running; for Notification Keeper, the notification permission, notification access, a companion device
-  link, and the accessibility service for the Gmail helper. Everything uses the permissions adb's shell user already
-  has. Nothing needs root.
+  link, and the accessibility service for the Gmail helper; for the Gmail Ghost app, its own paired Wireless
+  debugging key, the local network permission (it needs it to find Wireless debugging), the notification permission,
+  a battery whitelist entry and background running. The ghost itself runs as adb's shell user. Everything uses the
+  permissions adb's shell user already has. Nothing needs root.
 
 ## Getting Gmail Go
 
@@ -356,6 +407,76 @@ arriving, even with Gmail and Gmail Go closed. Press **Mark as read** and watch 
 
 A result line that contains `"detail": "marked read"` means it worked. Press Ctrl+C to stop watching the log.
 
+### Step 9. Move the ghost onto the Googlebook
+
+So far the ghost runs in the Linux Terminal, which stops whenever its window closes. This step moves it onto
+GooglebookOS itself, where it keeps working with the Linux Terminal closed. The sign-ins from step 7 come along, so
+you do not sign in again.
+
+1. Build the runtime, copy everything to the Googlebook and start the ghost there:
+
+   ```bash
+   sudo apt install patchelf
+   cd ~/googlebook-gmail-web-app-notifications/googlebook
+   ./install-on-googlebook.sh <GOOGLEBOOK_IP>:<PORT>
+   ```
+
+   The script builds the runtime into `googlebook/dist/` (about 2 minutes), streams it into
+   `/data/local/tmp/gmailghost` on the Googlebook, copies the profiles and starts the ghost. Its last lines must say
+   `running`. Running it again is safe: it reuses the newest runtime already built in `googlebook/dist/`, copies a
+   runtime only if the Googlebook does not have that one yet, and leaves profiles that are already on the Googlebook
+   as they are. After a newer build, the older runtime folder stays on the Googlebook until you remove it.
+
+2. Stop the Linux Terminal copy, so that only one ghost acts on each tap:
+
+   ```bash
+   systemctl --user disable --now ghostd.service
+   ```
+
+   If that service started your adb server, this stops the adb server too (it runs inside the service), so connect
+   again with `adb connect <GOOGLEBOOK_IP>:<PORT>` before the next adb command.
+
+3. Build and install the Gmail Ghost app, and give it what it needs to run in the background:
+
+   ```bash
+   cd ~/googlebook-gmail-web-app-notifications/gmail-ghost-app
+   ./build.sh
+   adb install --user <USER_ID> GmailGhost.apk
+   adb shell pm grant --user <USER_ID> local.gmailghost android.permission.ACCESS_LOCAL_NETWORK
+   adb shell pm grant --user <USER_ID> local.gmailghost android.permission.POST_NOTIFICATIONS
+   adb shell cmd deviceidle whitelist +local.gmailghost
+   adb shell cmd appops set --user <USER_ID> local.gmailghost RUN_ANY_IN_BACKGROUND allow
+   adb shell cmd appops set --user <USER_ID> local.gmailghost AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore
+   ```
+
+4. Give the app its own Wireless debugging key. Create the key and its certificate, and pair it through a separate
+   adb server so it never mixes with your own key. On the Googlebook, open **Settings > System > Developer options >
+   Wireless debugging > Pair device with pairing code**, and use the code and the **IP address & Port** shown in
+   that dialog (the pairing port is not the normal one):
+
+   ```bash
+   C=~/.config/gmail-ghost-app; mkdir -p $C/adbhome/.android; chmod 700 $C $C/adbhome $C/adbhome/.android
+   cd $C/adbhome/.android && adb keygen adbkey
+   head -c 24 /dev/urandom | base64 | tr -d '/+=' > $C/p12.pass; chmod 600 $C/p12.pass
+   openssl req -new -x509 -key adbkey -out $C/cert.pem -days 36500 -subj /CN=GmailGhost
+   openssl pkcs12 -export -inkey adbkey -in $C/cert.pem -out $C/key.p12 -passout "pass:$(cat $C/p12.pass)"
+   HOME=$C/adbhome adb -P 5044 pair <GOOGLEBOOK_IP>:<PAIRING_PORT> <PAIRING_CODE>
+   ```
+
+   Then hand the key to the app and let it run its first check:
+
+   ```bash
+   adb shell am broadcast --user <USER_ID> -n local.gmailghost/.ControlReceiver -a local.gmailghost.PROVISION \
+       --es p12 "$(base64 -w0 $C/key.p12)" --es pass "$(cat $C/p12.pass)"
+   adb shell am broadcast --user <USER_ID> -n local.gmailghost/.ControlReceiver -a local.gmailghost.CHECK
+   ```
+
+   The first command must answer `data="provisioned"`. Turn on **Disable adb authorization timeout** in Developer
+   options as the Getting started guide says; otherwise Android drops the app's pairing after 7 days without use.
+
+5. Open the Gmail Ghost app on the Googlebook. After its first check it shows **Running**. Close the Linux Terminal,
+   send yourself an email and press **Mark as read**. The email turns read within a few seconds.
+
 ## Using it
 
 Once it is set up, everything runs by itself.
@@ -368,15 +489,27 @@ Once it is set up, everything runs by itself.
   once the reply window is open.
 - **Delete:** the helper right-clicks the email and picks Delete, and the notification goes away once Delete has
   been picked. The helper does not check afterwards that the email is gone.
-- **Mark as read:** the notification goes away at once, and the ghost daemon marks the email read in the background
-  within about 4 to 6 seconds.
+- **Mark as read:** the notification goes away at once, and the ghost on the Googlebook marks the email read in the
+  background within about 4 to 6 seconds, whether or not the Linux Terminal is open.
 - **Opening an email yourself** in the Gmail web app clears its notification.
 - While the helper is working, it waits whenever another window is in front of Gmail, and it gives up after 45
   seconds. It handles one tap or button at a time; a newer one replaces an unfinished older one.
 
 ### Commands
 
-Run these in the repository folder in the Linux Terminal.
+Once the ghost runs on the Googlebook (step 9), these show and control it there:
+
+| Command | What it does |
+|---|---|
+| `adb shell sh /data/local/tmp/gmailghost/ghost.sh status` | First line `running` or `NOT running`, then when it started, how often the ghost was started, and the last result. |
+| `adb shell tail -20 /data/local/tmp/gmailghost/logs/ghostd.log` | What the ghost did: every command it received and its result. |
+| `adb shell sh /data/local/tmp/gmailghost/ghost.sh stop` | Stops the ghost. It stays stopped, also after a restart, until `start`. |
+| `adb shell sh /data/local/tmp/gmailghost/ghost.sh start` | Starts it again and clears a stop. |
+| The Gmail Ghost app on the Googlebook | Shows whether the ghost is running, its last result and the app's last check. **Check now** starts the ghost if it is not running, unless you stopped it with `ghost.sh stop`. |
+
+The commands below are for the Linux Terminal copy of the ghost (steps 5 to 8). Run them in the repository folder
+in the Linux Terminal. After step 9, `ghostctl status` and `doctor` report that copy, which is then switched off on
+purpose; `ghostctl enable` still signs an account in on Linux.
 
 | Command | What it does |
 |---|---|
@@ -469,9 +602,16 @@ the full Gmail app; for this setup, keep auto-updates off for Gmail Go.
 - **GooglebookOS updates:** a big update could switch off notification access or the accessibility service. Run
   `bin/notif-restore apply` for the Keeper's permissions, turn the Gmail helper back on by hand (step 6), and run
   `./ghostctl doctor`. Notification Keeper also posts an alert if it loses its notification access.
-- **Linux Terminal restarts:** the service is enabled for your systemd user session and restarts by itself if it
-  stops (`Restart=always`). Playwright and Chromium live in this folder's `venv/` and in Playwright's download cache,
-  so a GooglebookOS update does not touch them.
+- **Linux Terminal restarts:** once the ghost runs on the Googlebook (step 9), they do not affect Mark as read at
+  all. Before that, the service is enabled for your systemd user session and restarts by itself if it stops
+  (`Restart=always`). Playwright and Chromium live in this folder's `venv/` and in Playwright's download cache, so a
+  GooglebookOS update does not touch them.
+- **The ghost on the Googlebook:** after `git pull`, rebuild and reinstall the Gmail Ghost app
+  (`cd gmail-ghost-app && ./build.sh && adb install -r --user <USER_ID> GmailGhost.apk`). Its next check installs
+  the newer `ghostd.py`, `ghost.sh`, `env.sh` and `node-wrap.sh` on the Googlebook and restarts the ghost. A new
+  runtime (for example after a Playwright update in `venv/`) needs `googlebook/build-runtime.sh` and then
+  `googlebook/install-on-googlebook.sh <GOOGLEBOOK_IP>:<PORT>`. Restarting the Googlebook needs nothing: the Gmail
+  Ghost app starts the ghost again by itself once Wireless debugging is up.
 - **Expired sign-ins:** Google can end a saved session. `./ghostctl doctor` reports an account that is signed out;
   sign in again with `./ghostctl enable <account>`.
 - **Gmail web redesigns:** both the helper and the daemon rely on Gmail's web page layout and labels. A big redesign
@@ -479,6 +619,19 @@ the full Gmail app; for this setup, keep auto-updates off for Gmail Go.
   Notification Keeper's `WebGmailHelper.java`.
 
 ## Uninstalling
+
+If the ghost runs on the Googlebook, stop it, remove the Gmail Ghost app, and remove the ghost's folder (it holds
+your saved sign-ins) and its DNS settings file:
+
+```bash
+adb shell sh /data/local/tmp/gmailghost/ghost.sh stop
+adb shell pm uninstall --user <USER_ID> local.gmailghost
+adb shell rm -r /data/local/tmp/gmailghost
+adb shell rm /sdcard/.ggdns
+```
+
+The app's paired key stays listed under **Paired devices** on the Wireless debugging screen until you remove it
+there. Remove `~/.config/gmail-ghost-app` on the Linux side as well.
 
 Stop and remove the ghost daemon in the Linux Terminal:
 
@@ -533,7 +686,12 @@ seconds and left the notification in place. Check that the Gmail web app is sign
 display language is English, that the email is in the Inbox (not archived or filtered elsewhere), and that no other
 window covers Gmail while the helper works.
 
-**Mark as read did nothing.** Run `./ghostctl logs` and press the button again.
+**Mark as read did nothing.** If the ghost runs on the Googlebook, open the Gmail Ghost app or run
+`adb shell sh /data/local/tmp/gmailghost/ghost.sh status`, then press the button again and read the ghost's log with
+`adb shell tail -5 /data/local/tmp/gmailghost/logs/ghostd.log`. The result lines below are the same there. If the
+app says the ghost's runtime is missing, run `googlebook/install-on-googlebook.sh` again. If it says Wireless
+debugging is not reachable, turn Wireless debugging on. If the ghost still runs in the Linux Terminal, run
+`./ghostctl logs` and press the button again.
 
 - `no matching unread email (already read?)`: the email was already read, it is not in the Inbox, or it is not
   within the first 5 pages.
@@ -585,18 +743,28 @@ settings back). It asks you to type YES before it clears anything. You do not ne
   stores nothing.
 - **The Mark as read command is written to the Android system log.** It contains the email's subject and sender
   address, and adb and apps with log access can read it. The daemon also writes the first part of each command to
-  `logs/ghostd.log` in this folder and to its output, which systemd keeps in your user journal.
+  its log: on the Googlebook `/data/local/tmp/gmailghost/logs/ghostd.log`, and in the Linux Terminal
+  `logs/ghostd.log` in this folder and its output, which systemd keeps in your user journal.
 - **The ghost browser holds real Google sessions.** Each account's folder in `profiles/` contains that account's
   browser sign-in (cookies), much like a normal browser profile. Your password is not stored. Anyone who can read
   your Linux Terminal files could use those sessions, so keep the Terminal to yourself. `ghostctl disable` and
   turning an account off in Gmail Go only move the profile aside; delete it yourself to remove it, and sign the
-  session out in your Google Account if you want it ended on Google's side.
+  session out in your Google Account if you want it ended on Google's side. After step 9, a copy of each profile
+  also lives in `/data/local/tmp/gmailghost/profiles/` on the Googlebook, a folder only adb's shell user can read.
+- **The ghost on the Googlebook** asks its DNS questions to the servers in `/sdcard/.ggdns`: your network's DNS
+  servers first, then Google's (8.8.8.8) or Cloudflare's (1.1.1.1). So its lookups do not use Android's Private DNS
+  setting. The Gmail Ghost app's own key can run adb shell commands on the Googlebook; the app uses it only to start,
+  check and update the ghost, and a nonce check makes sure it talks to the real adb service.
 - The daemon starts Chromium with a flag that hides the standard automation marker
   (`--disable-blink-features=AutomationControlled`). It acts only on your own accounts, one email at a time, the way
   you would by hand. Automating a web service may not be allowed by that service's terms; decide for yourself
   whether you are comfortable with it.
-- **The daemon asks GooglebookOS for very little.** It only runs `adb connect` with a time limit and reads a
-  filtered `adb logcat` stream as it arrives, and otherwise it talks to Chromium and Gmail. `ghostctl list` asks for
+- **The daemon asks GooglebookOS for very little.** On the Googlebook it reads a filtered `logcat` stream as it
+  arrives, asks once for the current user (`am get-current-user`), looks at the Keeper's command folder through the
+  `content` tool once a minute, and writes a short marker to the log after 25 quiet seconds to check that its reader
+  still works; every one of those calls has a time limit. The supervisor reads the DNS servers from
+  `dumpsys connectivity` once per start of the ghost. In the Linux Terminal the daemon only runs `adb connect` with a
+  time limit and reads a filtered `adb logcat` stream as it arrives. Otherwise it talks to Chromium and Gmail. `ghostctl list` asks for
   the account list (`dumpsys account`), which is small. `notif-restore status` reads the notification service's
   report through adb with a 30 second time limit and processes it as it arrives.
 - Wireless debugging gives a paired computer a lot of control over your Googlebook. Only pair computers you own.
@@ -605,9 +773,13 @@ settings back). It asks you to type YES before it clears anything. You do not ne
 
 - **Mark as read gives no failure feedback.** The notification disappears as soon as you press the button, whether
   or not the daemon succeeds. Check `./ghostctl logs` if in doubt.
-- **Mark as read needs the Linux Terminal running, Wireless debugging on, and the current address in `ghost.env`.**
-  When the Wireless debugging port changes, you have to update `ghost.env`; the daemon does not find the new port by
-  itself.
+- **The Gmail Ghost app needs Wireless debugging on** to start the ghost after the Googlebook restarts. While the
+  ghost runs, it reads the Googlebook's log directly, so the Wireless debugging port does not matter to it.
+- **A new account is signed in on Linux.** The Googlebook has no screen for a Linux browser window, so sign a new
+  account in with `./ghostctl enable <account>` in the Linux Terminal and run `googlebook/install-on-googlebook.sh`
+  again to copy its profile over.
+- **The Linux Terminal copy** (steps 5 to 8, if you stop before step 9) needs the Linux Terminal running, Wireless
+  debugging on, and the current address in `ghost.env` or a helper's address file.
 - **Non-Gmail accounts are not handled.** Gmail Go can show notifications for other accounts, but the ghost browser
   only handles @gmail.com and @googlemail.com accounts, and the Gmail helper only works in the Gmail web app. Google Workspace accounts were not
   tested.
@@ -632,7 +804,13 @@ settings back). It asks you to type YES before it clears anything. You do not ne
 
 | File | Purpose |
 |---|---|
-| `ghostd.py` | The ghost daemon. With `--adb` it listens on logcat and marks emails read in a hidden Chromium. Without it, it watches `bridge/cmd/` for JSON command files instead (a testing mode that moves each processed file to `bridge/processed/`, writes the result to `bridge/done/`, and exits after 30 idle minutes, or after one batch with `--once`). |
+| `ghostd.py` | The ghost daemon. With `--device` it runs on the Googlebook, reads the system log directly and drains the Keeper's command folder. With `--adb` it runs on Linux and listens on logcat over adb. With neither, it watches `bridge/cmd/` for JSON command files instead (a testing mode that moves each processed file to `bridge/processed/`, writes the result to `bridge/done/`, and exits after 30 idle minutes, or after one batch with `--once`). In every mode it marks emails read in a hidden Chromium. |
+| `googlebook/build-runtime.sh` | Builds the runtime that lets the ghost run on the Googlebook (Python, Playwright, headless Chromium and their libraries) into `googlebook/dist/`. |
+| `googlebook/collect.py` | Copies every library the runtime's programs need; used by `build-runtime.sh`. |
+| `googlebook/install-on-googlebook.sh` | Copies the runtime, the profiles and the ghost's files to the Googlebook and starts the ghost. |
+| `googlebook/device/ghost.sh` | The supervisor on the Googlebook: `start`, `ensure`, `restart`, `stop`, `status`. |
+| `googlebook/device/env.sh`, `googlebook/device/node-wrap.sh` | The runtime's environment, and the wrapper that starts Playwright's node through the runtime's loader. |
+| `gmail-ghost-app/` | The Gmail Ghost app (Kotlin): starts the ghost after every restart, checks it every 15 minutes, installs newer ghost files, and shows whether it runs. `build.sh` builds and signs it. |
 | `ghostctl` | Manages the daemon and accounts: `status`, `list`, `enable`, `disable`, `test`, `doctor`, `logs`. |
 | `login.py` | The one-time, on-screen sign-in for one account into `profiles/<account>/`. |
 | `verify_login.py` | Checks that an account's saved sign-in still works. `ghostctl doctor` uses it. |

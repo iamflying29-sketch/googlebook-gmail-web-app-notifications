@@ -2,10 +2,13 @@
 """
 Ghost daemon: instant background "Mark as read" for the Notification Keeper.
 
-With --adb (the normal mode, used by the systemd service) it listens on adb logcat for the one-line
-commands the Notification Keeper logs under the tag GmailGhostCmd. Without --adb it watches the
-command folder bridge/cmd/ instead (a testing mode). For each command it marks the exact email read
-in a hidden, already-logged-in Chromium - no window, no screen touching.
+With --device (the normal mode) it runs on the Googlebook itself, as the adb shell user from
+/data/local/tmp/gmailghost (ghost.sh and the Gmail Ghost app start and supervise it), reads the
+one-line commands the Notification Keeper logs under the tag GmailGhostCmd straight from the device
+log, and drains the Keeper's command folder through Android's media storage. With --adb it runs on a
+Linux computer instead and listens on adb logcat. Without either it watches the command folder
+bridge/cmd/ (a testing mode). For each command it marks the exact email read in a hidden,
+already-logged-in Chromium, with no window and no screen touching.
 
 The Googlebook picks a new Wireless debugging port every time it re-joins Wi-Fi, so the daemon
 follows the address on its own and reconnects when the port moves. If you also run the Sleep Guard or
@@ -341,6 +344,11 @@ def account_enable(browsers, account):
     prof = os.path.join(PROFILES, account)
     if os.path.isdir(prof):
         return {"ok": True, "detail": "already set up"}
+    if "--device" in sys.argv:
+        # The Googlebook has no screen for a Linux browser window, so a new account is signed in with
+        # login.py on a Linux computer and its profile is copied into profiles/ (see README).
+        log("account_enable: " + account + " is not set up on this Googlebook")
+        return {"ok": False, "detail": "not set up on this Googlebook; sign it in with login.py and copy its profile"}
     try:
         env = dict(os.environ, DISPLAY=os.environ.get("DISPLAY", ":0"))
         subprocess.Popen([sys.executable, os.path.join(ROOT, "login.py"), account],
@@ -424,12 +432,47 @@ FILE_RETRY_EVERY = 60          # seconds between retries of a file command that 
 FILE_GIVE_UP_AFTER = 86400     # seconds (24 h): stop retrying a command older than this
 
 
+def handle_file_cmd(browsers, seen, last_try, name, cmd):
+    """Runs one command from the durable folder. Returns True when the file should be filed away in
+    processed/ (done, already handled, unusable, or given up), False to leave it for a later retry."""
+    now = time.time()
+    if not isinstance(cmd, dict):
+        return True                            # unreadable: file it away so we never look at it again
+    cid = cmd.get("id") or name
+    if cid in seen:
+        return True                            # already handled (the logcat path got there first)
+    if now - last_try.get(cid, 0) < FILE_RETRY_EVERY:
+        return False                           # backed off after a recent failure: leave it, try later
+    last_try[cid] = now
+    # No stale-time check: the whole point of the file is that a command the daemon missed still runs,
+    # however long ago it was tapped.
+    log("cmd via file " + name + ": " + json.dumps(cmd)[:160])
+    try:
+        result = process(browsers, cmd)
+    except Exception as e:
+        result = {"ok": False, "detail": "error: " + repr(e)[:140]}
+    log("  -> " + json.dumps(result)[:200])
+    detail = str(result.get("detail", ""))
+    if result.get("ok"):
+        seen.add(cid)
+        if len(seen) > 1000:
+            seen.clear(); seen.add(cid)
+        last_try.pop(cid, None)
+        return True
+    if "not set up" in detail or "not signed in" in detail or "no profile" in detail:
+        log("giving up on " + name + ": account not set up")
+        return True                            # non-retryable, do not loop on it
+    if cmd.get("ts") and now - cmd["ts"] / 1000.0 > FILE_GIVE_UP_AFTER:
+        log("giving up on " + name + ": older than a day and still failing")
+        return True
+    return False  # a transient failure (network or browser); leave the file and retry after backoff
+
+
 def drain_cmd_folder(browsers, seen, last_try):
     try:
         names = sorted(f for f in os.listdir(SHARED_CMD) if f.endswith(".json"))
     except OSError:
         return  # the folder is not there yet (no command has ever been written)
-    now = time.time()
     for name in names:
         path = os.path.join(SHARED_CMD, name)
         try:
@@ -437,45 +480,78 @@ def drain_cmd_folder(browsers, seen, last_try):
                 cmd = json.load(fh)
         except Exception:
             cmd = None
-        done = False
-        if not isinstance(cmd, dict):
-            done = True                        # unreadable: file it away so we never look at it again
-        else:
-            cid = cmd.get("id") or name
-            if cid in seen:
-                done = True                    # already handled (the logcat path got there first)
-            elif now - last_try.get(cid, 0) < FILE_RETRY_EVERY:
-                pass                           # backed off after a recent failure: leave it, try later
-            else:
-                last_try[cid] = now
-                # No stale-time check: the whole point of the file is that a command the daemon missed
-                # still runs, however long ago it was tapped.
-                log("cmd via file " + name + ": " + json.dumps(cmd)[:160])
-                try:
-                    result = process(browsers, cmd)
-                except Exception as e:
-                    result = {"ok": False, "detail": "error: " + repr(e)[:140]}
-                log("  -> " + json.dumps(result)[:200])
-                detail = str(result.get("detail", ""))
-                if result.get("ok"):
-                    seen.add(cid)
-                    if len(seen) > 1000:
-                        seen.clear(); seen.add(cid)
-                    last_try.pop(cid, None)
-                    done = True
-                elif "not set up" in detail or "not signed in" in detail or "no profile" in detail:
-                    log("giving up on " + name + ": account not set up")
-                    done = True                # non-retryable, do not loop on it
-                elif cmd.get("ts") and now - cmd["ts"] / 1000.0 > FILE_GIVE_UP_AFTER:
-                    log("giving up on " + name + ": older than a day and still failing")
-                    done = True
-                # else: a transient failure (network or browser); leave the file and retry after backoff
-        if done:
+        if handle_file_cmd(browsers, seen, last_try, name, cmd):
             try:
                 os.makedirs(SHARED_PROCESSED, exist_ok=True)
                 os.replace(path, os.path.join(SHARED_PROCESSED, name))  # MOVE aside, never delete
             except OSError as e:
                 log("could not move processed command file " + name + ": " + repr(e)[:100])
+
+
+# On the Googlebook itself (--device) the daemon runs as the adb shell user from
+# /data/local/tmp/gmailghost, so it reads the device log directly and reaches the Keeper's command
+# folder through Android's media storage with the "content" tool. No adb, no Wireless debugging port
+# and no Linux Terminal are involved.
+DEVICE_CMD_PATH = "Documents/Notification Keeper/cmd/"
+DEVICE_PROCESSED_PATH = "Documents/Notification Keeper/processed/"
+DEVICE_DRAIN_EVERY = 60    # seconds between checks of the command folder (each check starts an Android tool)
+ALIVE_FILE = os.path.join(ROOT, "logs", "alive")  # rewritten every few seconds; ghost.sh restarts a daemon that stops writing it
+_android_user = None
+
+
+def touch_alive():
+    try:
+        with open(ALIVE_FILE, "w") as f:
+            f.write(str(int(time.time())))
+    except OSError:
+        pass
+
+
+def android_tool(args, timeout=20, cap=262144):
+    """Runs an Android command-line tool (content, am, log) with a timeout and returns its output, or
+    None if it failed. The output is read while the tool writes, and the tool is killed on timeout."""
+    try:
+        r = subprocess.run(args, capture_output=True, timeout=timeout)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout[:cap].decode("utf-8", "replace")
+
+
+def android_user():
+    """The Android user the Keeper runs in (the current user), asked once and then remembered."""
+    global _android_user
+    if _android_user is None:
+        out = android_tool(["am", "get-current-user"], timeout=15)
+        if out and out.strip().isdigit():
+            _android_user = out.strip()
+    return _android_user
+
+
+def drain_cmd_device(browsers, seen, last_try):
+    """The durable backstop on the Googlebook: the Keeper's command files, read and filed away through
+    Android's media storage. Same retry rules as drain_cmd_folder; files are moved, never deleted."""
+    user = android_user()
+    if not user:
+        return
+    out = android_tool(["content", "query", "--user", user, "--uri", "content://media/external/file",
+                        "--projection", "_id:_display_name",
+                        "--where", "relative_path='" + DEVICE_CMD_PATH + "'"])
+    for m in sorted(re.finditer(r"_id=(\d+), _display_name=([^\s,]+\.json)", out or ""), key=lambda m: m.group(2)):
+        fid, name = m.group(1), m.group(2)
+        uri = "content://media/external/file/" + fid
+        text = android_tool(["content", "read", "--user", user, "--uri", uri], cap=65536)
+        try:
+            cmd = json.loads(text) if text else None
+        except Exception:
+            cmd = None
+        if text is None:
+            continue  # could not read it right now; try again on the next check
+        if handle_file_cmd(browsers, seen, last_try, name, cmd):
+            if android_tool(["content", "update", "--user", user, "--uri", uri,
+                             "--bind", "relative_path:s:" + DEVICE_PROCESSED_PATH]) is None:
+                log("could not move processed command file " + name)
 
 
 def run_adb(browsers, serial):
@@ -587,11 +663,137 @@ def run_adb(browsers, serial):
         time.sleep(1)
 
 
+def handle_logcat_line(browsers, line, seen, last_try, jsonre):
+    """Runs a command read from the log (either mode). Commands are deduped by id, stale ones skipped."""
+    m = jsonre.search(line)
+    if not m:
+        return
+    try:
+        cmd = json.loads(m.group(0))
+    except Exception:
+        return
+    if cmd.get("op") == "heartbeat":
+        return                    # ignore a JSON heartbeat too, just in case
+    cid = cmd.get("id") or m.group(0)
+    if cid in seen:
+        return                    # already marked read successfully
+    if cmd.get("ts") and time.time() - cmd["ts"] / 1000.0 > STALE_CMD_SECONDS:
+        return                    # too old for the fast path; the durable file still retries it
+    if time.time() - last_try.get(cid, 0) < FILE_RETRY_EVERY:
+        return                    # backed off after a recent failure; do not hammer
+    last_try[cid] = time.time()
+    log("cmd via logcat: " + json.dumps(cmd)[:160])
+    result = process(browsers, cmd)
+    log("  -> " + json.dumps(result)[:200])
+    # Mark it handled ONLY once the mark-read truly worked; a failure leaves it for the durable file.
+    if result.get("ok"):
+        seen.add(cid)
+        if len(seen) > 500:
+            seen.clear(); seen.add(cid)
+        last_try.pop(cid, None)
+
+
+def run_device(browsers):
+    """Listen for the Keeper's commands in the Googlebook's own log (we run on the Googlebook as the
+    adb shell user). The same stall watchdog as the adb mode restarts a reader that goes deaf, and the
+    durable command folder is drained at every (re)start and once a minute."""
+    seen = set()
+    last_try = {}
+    jsonre = re.compile(r"\{.*\}")
+    while True:
+        touch_alive()
+        drain_cmd_device(browsers, seen, last_try)
+        last_drain = time.time()
+        # -T 200 replays the last command lines on every (re)start, so a tap made while the reader was
+        # restarting is still handled; the dedupe set and the stale filter stop repeats. Android's
+        # logcat holds its output back when it writes into a pipe, so it writes into a pseudo terminal
+        # instead, which makes it send every line the moment it is logged.
+        master, slave = os.openpty()
+        try:
+            import tty
+            tty.setraw(slave)  # no line-ending translation
+        except Exception:
+            pass
+        proc = subprocess.Popen(["logcat", "-s", LOGCAT_TAG + ":I", "-T", "200"],
+                                stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.DEVNULL)
+        os.close(slave)
+        log("listening on the Googlebook's own log, tag " + LOGCAT_TAG)
+        last_rx = time.time()
+        hb_pending = False
+        hb_sent_at = 0.0
+        pending = b""
+        try:
+            while True:
+                ready, _, _ = select.select([master], [], [], 5)
+                now = time.time()
+                touch_alive()
+                if not ready:
+                    browsers.close_idle()
+                    if now - last_drain >= DEVICE_DRAIN_EVERY:
+                        drain_cmd_device(browsers, seen, last_try)
+                        last_drain = time.time()
+                    if proc.poll() is not None:
+                        break
+                    if hb_pending:
+                        if now - hb_sent_at > HEARTBEAT_TIMEOUT:
+                            log("log reader stalled (heartbeat not seen in %ds); restarting it" % HEARTBEAT_TIMEOUT)
+                            break
+                    elif now - last_rx > HEARTBEAT_AFTER_SILENCE:
+                        token = "hbPING" + str(time.time_ns())
+                        if android_tool(["log", "-p", "i", "-t", LOGCAT_TAG, token], timeout=10) is None:
+                            log("heartbeat could not be written; restarting the log reader")
+                            break
+                        hb_pending = True
+                        hb_sent_at = now
+                    continue
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    chunk = b""  # the terminal reports an error once logcat has exited
+                if not chunk:
+                    break  # stream ended; the outer loop restarts it
+                last_rx = now
+                hb_pending = False
+                # Every complete line that arrived is handled now; a partial line waits for its end.
+                pending = (pending + chunk)[-1048576:]
+                *lines, pending = pending.split(b"\n")
+                for raw in lines:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line or "hbPING" in line:
+                        continue
+                    handle_logcat_line(browsers, line, seen, last_try, jsonre)
+                browsers.close_idle()
+        finally:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                os.close(master)
+            except OSError:
+                pass
+        time.sleep(1)
+
+
 def main():
     for d in (CMD, PROCESSED, DONE, PROFILES, os.path.dirname(LOG)):
         os.makedirs(d, exist_ok=True)
     once = "--once" in sys.argv
     adb_mode = "--adb" in sys.argv
+    if "--device" in sys.argv:
+        log("ghostd started (Googlebook mode)")
+        with sync_playwright() as pw:
+            browsers = Browsers(pw)
+            try:
+                run_device(browsers)
+            finally:
+                browsers.close_all()
+                log("ghostd stopped")
+        return
     if adb_mode:
         serial = current_serial()
         if not serial:

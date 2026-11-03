@@ -35,3 +35,6 @@ venv/
 # Editor and system files
 .DS_Store
 *.swp
+
+# The Googlebook runtime builds (googlebook/build-runtime.sh): Debian programs and libraries, never committed
+googlebook/dist/
